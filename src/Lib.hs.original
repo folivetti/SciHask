@@ -1,0 +1,205 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE BlockArguments #-}
+module Lib
+    ( genTwoArrs
+      , genTwoH
+      , genTwoVecs
+      , genTwoHV
+      , genSymArr
+      , genSymH
+      , outer
+      , cholesky
+      , unblocked
+      , invChol
+    ) where
+
+import System.Random
+import Control.Monad ( when, forM_ )
+
+import qualified Numeric.LinearAlgebra as LA
+
+import qualified Data.Massiv.Array as MA
+import qualified Data.Massiv.Array.Unsafe as UMA
+import qualified Data.Massiv.Array.Mutable as MMA
+import Data.Massiv.Array ( Array, S, Ix2(..), Ix1(..) )
+
+
+type MassArray = Array S Ix2 Double
+type MassVec = Array S Ix1 Double
+type MMassArray m = MMA.MArray (MA.PrimState m) S Ix2 Double
+
+-- Vector gen
+genRandomVec :: Int -> StdGen -> (StdGen, MassVec)
+genRandomVec m g = MA.randomArrayS g (MA.Sz1 m) random
+{-# INLINE genRandomVec #-}
+
+genTwoVecs :: Int -> StdGen -> (MassVec, MassVec)
+genTwoVecs m g = case genRandomVec m g of
+                   (g', vec1) -> (vec1, snd $ genRandomVec m g')
+{-# INLINE genTwoVecs #-}
+
+genTwoHV :: Int -> StdGen -> (LA.Vector Double, LA.Vector Double)
+genTwoHV m g = let (v1, v2) = genTwoVecs m g
+                in (LA.fromList $ MA.toList v1, LA.fromList $ MA.toList v2)
+{-# INLINE genTwoHV #-}
+
+-- Matrix gen
+genRandomArr :: Int -> Int -> StdGen -> (StdGen, MassArray)
+genRandomArr m n g = MA.randomArrayS g (MA.Sz2 m n) random
+{-# INLINE genRandomArr #-}
+
+genTwoArrs :: Int -> Int -> StdGen -> (MassArray, MassArray)
+genTwoArrs m n g = case genRandomArr m n g of
+                   (g', arr1) -> (arr1, snd $ genRandomArr m n g')
+{-# INLINE genTwoArrs #-}
+
+toHMatrix :: MassArray -> LA.Matrix Double
+toHMatrix = LA.fromLists . MA.toLists
+{-# INLINE toHMatrix #-}
+
+genTwoH :: Int -> Int -> StdGen -> (LA.Matrix Double, LA.Matrix Double)
+genTwoH m n g = let (arr1, arr2) = genTwoArrs m n g
+               in (toHMatrix arr1, toHMatrix arr2)
+{-# INLINE genTwoH #-}
+
+genSymArr :: Int -> MassArray
+genSymArr n = MA.makeArray MA.Seq (MA.Sz2 n n) (\ (i :. j) -> (if i /= j then (/(fromIntegral n)) else id) $ fromIntegral $ (n - i) * (n - j))
+{-# INLINE genSymArr #-}
+
+genSymH :: Int -> LA.Matrix Double
+genSymH n = toHMatrix (genSymArr n)
+{-# INLINE genSymH #-}
+
+outer :: (MA.MonadThrow m)
+  => MassVec
+  -> MassVec
+  -> m MassArray
+outer arr1 arr2
+  | MA.isEmpty arr1 || MA.isEmpty arr2 = pure $ MA.setComp comp MA.empty
+  | otherwise =
+      pure $ MA.makeArray comp (MA.Sz2 m1 m2) $ \(i :. j) ->
+          UMA.unsafeIndex arr1 i * UMA.unsafeIndex arr2 j
+  where
+      comp = MA.getComp arr1 <> MA.getComp arr2
+      MA.Sz1 m1 = MA.size arr1
+      MA.Sz1 m2 = MA.size arr2
+{-# INLINE outer #-}
+
+cholesky :: (MA.PrimMonad m, MA.MonadThrow m)
+  => MassArray
+  -> m MassArray
+cholesky arr
+  | m /= n          = MA.throwM $ MA.SizeMismatchException (MA.size arr) (MA.size arr)
+  | MA.isEmpty arr  = pure $ MA.setComp comp MA.empty
+  | otherwise       = MMA.createArrayS_ (MA.size arr) create
+  where
+    comp         = MA.getComp arr
+    (MA.Sz2 m n) = MA.size arr
+    create l     = mapM_ (update l) [i :. j | i <- [0..m], j <- [0..m]]
+
+    update l ix@(i :. j)
+      | i < j     = UMA.unsafeWrite l ix 0
+      | i == j    = do let cur = UMA.unsafeIndex arr ix
+                       tot <- go 0 0 j
+                       UMA.unsafeWrite l ix (sqrt (cur - tot))
+      | otherwise = do let cur = UMA.unsafeIndex arr ix
+                       tot <- rangedLinearDotProd (i*m) (j*m) j l -- go 0 0 j
+                       x   <- UMA.unsafeLinearRead l (j*m + j)
+                       UMA.unsafeWrite l ix ((cur - tot) / x)
+      where
+          go !acc k len
+            | k < len = do x <- UMA.unsafeLinearRead l (i*m + k)
+                           y <- UMA.unsafeLinearRead l (j*m + k)
+                           go (acc + x*y) (k+1) len
+            | otherwise = pure acc
+{-# INLINE cholesky #-}
+
+rangedLinearDotProd :: MA.PrimMonad m => Int -> Int -> Int -> MMassArray m -> m Double
+rangedLinearDotProd r1 r2 len arr = go 0 0
+  where
+    go !acc k
+      | k < len   = do x <- UMA.unsafeLinearRead arr (r1 + k)
+                       y <- UMA.unsafeLinearRead arr (r2 + k)
+                       go (acc + x*y) (k + 1)
+      | otherwise = pure acc 
+{-# INLINE rangedLinearDotProd #-}
+
+unblocked :: (MA.PrimMonad m, MA.MonadThrow m)
+  => MassArray
+  -> Ix2
+  -> Int
+  -> m MassArray
+unblocked arr (_ :. _) m = do l <- MA.thawS arr
+                              go l 0
+                              forM_ [0 .. m-1] $ \i ->
+                                  forM_ [i+1 .. m-1] $ \j ->
+                                      UMA.unsafeWrite l (i :. j) 0
+                              MA.freezeS l
+  where
+    comp = MA.getComp arr
+
+    go :: (MA.PrimMonad m, MA.MonadThrow m, MA.FoldNumeric r Double, MMA.Manifest r Double) => MMA.MArray (MA.PrimState m) r Ix2 Double -> Int -> m ()
+    go l k
+      | k == m    = pure ()
+      | otherwise = do a10 <- UMA.unsafeFreeze comp $ UMA.unsafeLinearSliceMArray (k*m) (MA.Sz1 k) l
+                       x <- UMA.unsafeLinearRead l (k*m + k)
+                       sn <- if k == 0
+                                then pure 0
+                                else do aII <- UMA.unsafeFreeze comp $ UMA.unsafeLinearSliceMArray (k*m) (MA.Sz k) l -- squareNormM (k-1) 0
+                                        MA.dotM aII aII
+                       UMA.unsafeWrite l (k :. k) $ sqrt (x - sn)
+                       when (k > 0 && rs > 0) $ do
+                           forM_ [k + 1 .. m - 1] $ \j -> do
+                               a20 <- UMA.unsafeFreeze comp $ UMA.unsafeLinearSliceMArray (j*m) (MA.Sz1 k) l
+                               y <- UMA.unsafeLinearRead l (j*m + k)
+                               dotp <- MA.dotM a10 a20
+                               UMA.unsafeWrite l (j :. k) (y - dotp)
+                       when (rs > 0) $ do
+                         forM_ [k + 1 .. m - 1] $ \j -> do
+                             y <- UMA.unsafeLinearRead l (j*m + k)
+                             v <- UMA.unsafeLinearRead l (k*m + k)
+                             UMA.unsafeWrite l (j :. k) (y / v) -- A21 /= sqrt x
+                       go l (k+1)
+      where
+        rs = m - k - 1
+        squareNormM 0 !acc = do x <- UMA.unsafeLinearRead l (k*m)
+                                pure (acc + x^2)
+        squareNormM ix !acc = do x <- UMA.unsafeLinearRead l (k*m + ix)
+                                 squareNormM (ix-1) (acc + x^2)
+{-# INLINE unblocked #-}
+
+invChol :: (MA.PrimMonad m, MA.MonadThrow m) => MassArray -> m MassArray
+invChol arr = do l <- unblocked arr (0 :. 0) m
+                 mtx <- UMA.unsafeThaw l
+                 forM_ [0 .. m-1] $ \i -> do
+                     lII <- UMA.unsafeRead mtx (i :. i)
+                     UMA.unsafeWrite mtx (i :. i) (1 / lII)
+                     forM_ [0 .. i-1] $ \j -> do
+                         lIK <- UMA.unsafeFreeze comp $ UMA.unsafeLinearSliceMArray (i*m + j) (MA.Sz (i-j)) mtx
+                         lJK <- UMA.unsafeFreeze comp $ UMA.unsafeLinearSliceMArray (j*m + j) (MA.Sz (i-j)) mtx
+                         tot <- MA.dotM lIK lJK
+                         UMA.unsafeWrite mtx (j :. i) (-tot/lII)
+                         UMA.unsafeWrite mtx (i :. j) 0
+                 mm <- MA.newMArray (MA.Sz2 m m) 0
+                 forM_ [0 .. m-1] $ \i -> do
+                     d <- unsafeDotProduct (i*m + i) (i*m + i) (m - i) mtx
+                     UMA.unsafeWrite mm (i :. i) d
+                     forM_ [i+1 .. m-1] $ \j -> do
+                          d <- unsafeDotProduct (i*m + j) (j*m + j) (m - j) mtx
+                          UMA.unsafeWrite mm (i :. j) d
+                          UMA.unsafeWrite mm (j :. i) d
+                 UMA.unsafeFreeze comp mm
+
+  where
+    MA.Sz2 m _ = MA.size arr
+    comp = MA.getComp arr
+
+    unsafeDotProduct i j n mtx = go 0 0
+      where
+        go !acc k
+          | k < n = do x <- UMA.unsafeLinearRead mtx (i + k)
+                       y <- UMA.unsafeLinearRead mtx (j + k)
+                       go (acc + x*y) (k + 1)
+          | otherwise = pure acc
+{-# INLINE invChol #-}
